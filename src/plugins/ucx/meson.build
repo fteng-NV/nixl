@@ -22,6 +22,7 @@ ucx_backend_sources = ['config.cpp',
                        'rkey.cpp',
                        'ucx_backend.cpp',
                        'ucx_enums.cpp',
+                       'ucx_numa.cpp',
                        'ucx_plugin.cpp',
                        'ucx_utils.cpp']
 

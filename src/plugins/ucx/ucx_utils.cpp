@@ -255,13 +255,30 @@ nixlUcxEp::sendAm(nixl::ucx::am_cb_op_t msg_id,
  * Data transfer
  * =========================================== */
 
+ /*
+ * Mooncake-style send completion callback for RMA operations.
+ * This fires during ucp_worker_progress() on the progress thread.
+ * It atomically increments the completed/failed counter so that
+ * the user thread can observe completion without calling progress().
+ */
+void
+nixlUcxSendCompletionCb(void *request, ucs_status_t status, void *user_data) {
+    auto *ctx = static_cast<nixlUcxCompletionCtx *>(user_data);
+    if (status == UCS_OK) {
+        ctx->completedCount->fetch_add(1, std::memory_order_release);
+    } else {
+        ctx->failedCount->fetch_add(1, std::memory_order_release);
+    }
+}
+
 nixl_status_t
 nixlUcxEp::read(uint64_t raddr,
                 const nixl::ucx::rkey &rkey,
                 void *laddr,
                 nixlUcxMem &mem,
                 size_t size,
-                nixlUcxReq &req) {
+                nixlUcxReq &req,
+                nixlUcxCompletionCtx *completion_ctx) {
     nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
@@ -272,10 +289,21 @@ nixlUcxEp::read(uint64_t raddr,
         .memh = mem.memh,
     };
 
+    if (completion_ctx) {
+        param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+        param.cb.send = nixlUcxSendCompletionCb;
+        param.user_data = completion_ctx;
+    }
+
     const ucs_status_ptr_t request = ucp_get_nbx(eph, laddr, size, raddr, rkey.get(), &param);
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
         return NIXL_IN_PROG;
+    }
+
+    /* Completed immediately — count it if callback mode */
+    if (completion_ctx && UCS_PTR_STATUS(request) == UCS_OK) {
+        completion_ctx->completedCount->fetch_add(1, std::memory_order_release);
     }
 
     return nixl::ucx::ucsToNixlStatus(UCS_PTR_STATUS(request));
@@ -287,7 +315,8 @@ nixlUcxEp::write(void *laddr,
                  uint64_t raddr,
                  const nixl::ucx::rkey &rkey,
                  size_t size,
-                 nixlUcxReq &req) {
+                 nixlUcxReq &req,
+                 nixlUcxCompletionCtx *completion_ctx) {
     nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
@@ -298,10 +327,21 @@ nixlUcxEp::write(void *laddr,
         .memh = mem.memh,
     };
 
+    if (completion_ctx) {
+        param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+        param.cb.send = nixlUcxSendCompletionCb;
+        param.user_data = completion_ctx;
+    }
+
     const ucs_status_ptr_t request = ucp_put_nbx(eph, laddr, size, raddr, rkey.get(), &param);
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
         return NIXL_IN_PROG;
+    }
+
+    /* Completed immediately — count it if callback mode */
+    if (completion_ctx && UCS_PTR_STATUS(request) == UCS_OK) {
+        completion_ctx->completedCount->fetch_add(1, std::memory_order_release);
     }
 
     return nixl::ucx::ucsToNixlStatus(UCS_PTR_STATUS(request));
@@ -336,16 +376,28 @@ nixlUcxEp::estimateCost(size_t size,
 }
 
 nixl_status_t
-nixlUcxEp::flushEp(nixlUcxReq &req) {
+nixlUcxEp::flushEp(nixlUcxReq &req, nixlUcxCompletionCtx *completion_ctx) {
     ucp_request_param_t param;
     ucs_status_ptr_t request;
 
     param.op_attr_mask = 0;
+
+    if (completion_ctx) {
+        param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+        param.cb.send = nixlUcxSendCompletionCb;
+        param.user_data = completion_ctx;
+    }
+
     request = ucp_ep_flush_nbx(eph, &param);
 
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
         return NIXL_IN_PROG;
+    }
+
+    /* Completed immediately — count it if callback mode */
+    if (completion_ctx && UCS_PTR_STATUS(request) == UCS_OK) {
+        completion_ctx->completedCount->fetch_add(1, std::memory_order_release);
     }
 
     return nixl::ucx::ucsToNixlStatus(UCS_PTR_STATUS(request));

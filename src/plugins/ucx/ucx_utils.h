@@ -57,6 +57,23 @@ nixl_b_params_get(const nixl_b_params_t *custom_params, const std::string &key, 
 
 using nixlUcxReq = void *;
 
+/**
+ * Completion context for Mooncake-style callback-based completion tracking.
+ * Passed as user_data to UCX send callbacks. The progress thread drives
+ * completions; user threads only read atomic counters — zero lock contention.
+ */
+ struct nixlUcxCompletionCtx {
+    std::atomic<size_t> *completedCount;
+    std::atomic<size_t> *failedCount;
+};
+
+/**
+ * UCX send completion callback for RMA operations (put/get/flush).
+ * Called by whichever thread runs ucp_worker_progress() — in busy-poll
+ * mode that is exclusively the progress thread.
+ */
+void nixlUcxSendCompletionCb(void *request, ucs_status_t status, void *user_data);
+
 class nixlUcxMem;
 
 class nixlUcxEp {
@@ -111,21 +128,23 @@ public:
          void *laddr,
          nixlUcxMem &mem,
          size_t size,
-         nixlUcxReq &req);
+         nixlUcxReq &req,
+         nixlUcxCompletionCtx *completion_ctx = nullptr);
     [[nodiscard]] nixl_status_t
     write(void *laddr,
           nixlUcxMem &mem,
           uint64_t raddr,
           const nixl::ucx::rkey &rkey,
           size_t size,
-          nixlUcxReq &req);
+          nixlUcxReq &req,
+          nixlUcxCompletionCtx *completion_ctx = nullptr);
     nixl_status_t
     estimateCost(size_t size,
                  std::chrono::microseconds &duration,
                  std::chrono::microseconds &err_margin,
                  nixl_cost_t &method);
     nixl_status_t
-    flushEp(nixlUcxReq &req);
+    flushEp(nixlUcxReq &req, nixlUcxCompletionCtx *completion_ctx = nullptr);
 
     [[nodiscard]] ucp_ep_h
     getEp() const noexcept {

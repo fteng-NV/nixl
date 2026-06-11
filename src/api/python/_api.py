@@ -138,6 +138,8 @@ class nixl_thread_sync_t(Enum):
 @param listen_port Specify the port for the listener thread to listen on.
 @param capture_telemetry Whether to enable telemetry capture.
 @param num_threads Specify number of threads for the supported multi-threaded backends.
+@param device_list UCX network device list passed as backend init param "device_list".
+        Example: "mlx5_0:1,mlx5_1:1". When set, it is applied when creating UCX backend.
 @param backends List of backend names for agent to initialize.
         Default is UCX, other backends can be added to the list, or after
         agent creation, can be initialized with create_backend.
@@ -154,6 +156,7 @@ class nixl_agent_config:
         listen_port: int = DEFAULT_COMM_PORT,
         capture_telemetry: bool = False,
         num_threads: int = 0,
+        device_list: str = "",
         backends: list[str] = ["UCX"],
         sync_mode: Optional[nixl_thread_sync_t] = None,
     ):
@@ -164,6 +167,7 @@ class nixl_agent_config:
         self.port = listen_port
         self.capture_telemetry = capture_telemetry
         self.num_threads = num_threads
+        self.device_list = device_list
         if sync_mode is not None and not isinstance(sync_mode, nixl_thread_sync_t):
             raise TypeError(
                 f"sync_mode must be a nixl_thread_sync_t (got {type(sync_mode).__name__!r})"
@@ -249,6 +253,8 @@ class nixl_agent:
                         init["thread_count"] = str(nixl_conf.num_threads)
                     elif bknd == "UCCL":
                         init["num_cpus"] = str(nixl_conf.num_threads)
+                if bknd == "UCX" and nixl_conf.device_list:
+                    init["device_list"] = nixl_conf.device_list
                 self.create_backend(bknd, init)
 
         self.nixl_mems = {

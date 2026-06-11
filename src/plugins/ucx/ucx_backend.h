@@ -38,6 +38,7 @@
 #include "rkey.h"
 #include "ucx_enums.h"
 #include "ucx_utils.h"
+#include "ucx_numa.h"
 
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
@@ -186,6 +187,24 @@ public:
     void
     progressLoop();
 
+    /**
+     * Returns true if the engine is running a busy-poll progress thread.
+     * Override in subclasses that support busy-poll mode.
+     */
+    [[nodiscard]] virtual bool
+    isBusyPoll() const noexcept {
+        return false;
+    }
+
+    /**
+     * Get the NUMA node of the primary network device
+     * @return NUMA node ID, or -1 if not determined
+     */
+    [[nodiscard]] int
+    getDeviceNumaNode() const noexcept {
+        return deviceNumaNode_;
+    }
+
     nixl_status_t
     getNotifs(notif_list_t &notif_list) override;
     nixl_status_t
@@ -269,6 +288,7 @@ private:
         nixl_status_t status;
         size_t size;
         nixlUcxReq req;
+        size_t inflightCount;  ///< Number of requests tracked by callback
     };
 
     static batchResult
@@ -278,7 +298,8 @@ private:
                        const nixl_meta_dlist_t &remote,
                        size_t worker_id,
                        size_t start_idx,
-                       size_t end_idx);
+                       size_t end_idx,
+                       nixlUcxCompletionCtx *completion_ctx = nullptr);
 
     /**
      * Get the worker ID from the optional arguments.
@@ -295,6 +316,12 @@ private:
 
     // Map of agent name to saved nixlUcxConnection info
     std::unordered_map<std::string, ucx_connection_ptr_t> remoteConnMap;
+
+    /* NUMA affinity */
+    int deviceNumaNode_{-1};     // NUMA node of the primary network device
+    std::vector<std::string> devNames_; // Network device names for NUMA lookup
+
+    const bool progressThreadEnabled_;
 };
 
 class nixlUcxThread;
@@ -310,6 +337,15 @@ public:
     nixl_status_t
     getNotifs(notif_list_t &notif_list) override;
 
+    /**
+     * Returns true if the progress thread is running in Mooncake-style
+     * busy-poll mode (tight-loop CQ processing, no sleeping).
+     */
+     [[nodiscard]] bool
+     isBusyPoll() const noexcept override {
+         return busyPoll_;
+     }
+
 protected:
     void
     appendNotif(std::string &&remote_name, std::string &&msg) override;
@@ -317,6 +353,7 @@ protected:
 private:
     std::unique_ptr<nixlUcxThread> thread_;
     std::mutex notifMutex_;
+    bool busyPoll_{false};
 };
 
 namespace asio {

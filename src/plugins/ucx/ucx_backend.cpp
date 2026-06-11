@@ -16,6 +16,7 @@
  */
 
 #include "ucx_backend.h"
+#include "ucx_numa.h"
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include "common/nixl_log.h"
@@ -41,6 +42,20 @@ private:
     std::vector<nixlUcxReq> requests_;
     nixlUcxWorker *worker_;
     size_t workerId_;
+
+    /*
+     * Callback mode state for Mooncake-style completion detection.
+     * When enabled, completions are tracked via atomic counters updated
+     * by UCX send callbacks (driven by the progress thread), rather than
+     * iterating over request handles. The user thread never calls
+     * worker->progress(), eliminating UCX worker lock contention.
+     */
+    bool callbackMode_{false};
+    bool busyPollMode_{false};
+    std::atomic<size_t> completedCount_{0};
+    std::atomic<size_t> failedCount_{0};
+    size_t totalPosted_{0};
+    nixlUcxCompletionCtx compCtx_;
 
     [[nodiscard]] nixl_status_t
     checkConnection(const nixl_status_t status = NIXL_SUCCESS) const {
@@ -77,7 +92,35 @@ public:
 
     nixlUcxBackendReqH(nixlUcxWorker *worker, size_t worker_id)
         : worker_(worker),
-          workerId_(worker_id) {}
+          workerId_(worker_id) {
+            compCtx_.completedCount = &completedCount_;
+            compCtx_.failedCount = &failedCount_;
+    }
+
+    /* Move constructor — needed because std::atomic is not movable.
+     * We manually transfer the atomic values and re-point compCtx_ to
+     * *this* object's atomics (not the moved-from object's).
+     */
+    nixlUcxBackendReqH(nixlUcxBackendReqH &&other) noexcept
+        : connections_(std::move(other.connections_)),
+          requests_(std::move(other.requests_)),
+          worker_(other.worker_),
+          workerId_(other.workerId_),
+          callbackMode_(other.callbackMode_),
+          busyPollMode_(other.busyPollMode_),
+          completedCount_(other.completedCount_.load(std::memory_order_relaxed)),
+          failedCount_(other.failedCount_.load(std::memory_order_relaxed)),
+          totalPosted_(other.totalPosted_),
+          notif(std::move(other.notif)) {
+        compCtx_.completedCount = &completedCount_;
+        compCtx_.failedCount = &failedCount_;
+        other.worker_ = nullptr;
+        other.workerId_ = UINT64_MAX;
+    }
+
+    nixlUcxBackendReqH &operator=(nixlUcxBackendReqH &&) = delete;
+    nixlUcxBackendReqH(const nixlUcxBackendReqH &) = delete;
+    nixlUcxBackendReqH &operator=(const nixlUcxBackendReqH &) = delete;
 
     void
     reserve(size_t size) {
@@ -85,8 +128,74 @@ public:
         NIXL_ASSERT(connections_.empty());
     }
 
+    /**
+     * Enable callback mode for this handle. Called once after handle creation
+     * when progress thread is active.
+     * @param busyPoll If true, status() will NOT call worker->progress()
+     */
+    void
+    enableCallbackMode(bool busyPoll) {
+        callbackMode_ = true;
+        busyPollMode_ = busyPoll;
+        completedCount_.store(0, std::memory_order_relaxed);
+        failedCount_.store(0, std::memory_order_relaxed);
+        totalPosted_ = 0;
+    }
+
+    bool
+    isCallbackMode() const {
+        return callbackMode_;
+    }
+
+    /**
+     * Get the completion context pointer for passing to read/write/flush.
+     * Returns nullptr if not in callback mode.
+     */
+    nixlUcxCompletionCtx *
+    getCompCtx() {
+        return callbackMode_ ? &compCtx_ : nullptr;
+    }
+
     [[nodiscard]] nixl_status_t
-    append(nixl_status_t status, nixlUcxReq req, const ucx_connection_ptr_t &conn) {
+    append(nixl_status_t status, nixlUcxReq req, const ucx_connection_ptr_t &conn,
+           size_t inflightCount = 0) {
+        switch (status) {
+        case NIXL_IN_PROG:
+            if (callbackMode_) {
+                totalPosted_ += inflightCount;
+                /* In callback mode, completions are tracked via atomic counters
+                 * updated by UCX callbacks. We free the request handle here —
+                 * the callback is already registered and will still fire when
+                 * the operation completes (UCX guarantees this even after
+                 * ucp_request_free). */
+                if (req != nullptr) {
+                    ucp_request_free(req);
+                }
+            } else {
+                requests_.push_back(req);
+            }
+            connections_.insert(conn);
+            break;
+        case NIXL_SUCCESS:
+            if (callbackMode_ && inflightCount > 0) {
+                totalPosted_ += inflightCount;
+            }
+            connections_.insert(conn);
+            break;
+        default:
+            // Error. Release all previously initiated ops and exit:
+            release();
+            return status;
+        }
+        return NIXL_SUCCESS;
+    }
+
+    /**
+     * Append a legacy request (e.g., notification sendAm) that is NOT tracked
+     * by callback mode. These still need request-based completion polling.
+     */
+    [[nodiscard]] nixl_status_t
+    appendLegacy(nixl_status_t status, nixlUcxReq req, const ucx_connection_ptr_t &conn) {
         switch (status) {
         case NIXL_IN_PROG:
             requests_.push_back(req);
@@ -96,7 +205,6 @@ public:
             connections_.insert(conn);
             break;
         default:
-            // Error. Release all previously initiated ops and exit:
             release();
             return status;
         }
@@ -127,10 +235,37 @@ public:
         }
         requests_.clear();
         connections_.clear();
+        if (callbackMode_) {
+            completedCount_.store(0, std::memory_order_relaxed);
+            failedCount_.store(0, std::memory_order_relaxed);
+            totalPosted_ = 0;
+        }
     }
 
     [[nodiscard]] virtual nixl_status_t
     status() {
+        if (callbackMode_) {
+            return statusCallback();
+        }
+        return statusLegacy();
+    }
+
+    [[nodiscard]] nixlUcxWorker *
+    getWorker() const noexcept {
+        return worker_;
+    }
+
+    [[nodiscard]] size_t
+    getWorkerId() const noexcept {
+        return workerId_;
+    }
+
+    /**
+     * Legacy status check: iterates request handles, calls worker->progress().
+     * Used when progress thread is not active (no callback mode).
+     */
+    [[nodiscard]] nixl_status_t
+    statusLegacy() {
         if (requests_.empty()) {
             /* No pending transmissions */
             connections_.clear();
@@ -155,7 +290,7 @@ public:
         nixl_status_t out_ret = NIXL_SUCCESS;
         for (nixlUcxReq req : requests_) {
             const nixl_status_t ret = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
-            if (ret == NIXL_SUCCESS) [[likely]] {
+            if (__builtin_expect(ret == NIXL_SUCCESS, 0)) {
                 worker_->reqRelease(req);
             } else if (ret == NIXL_IN_PROG) {
                 if (out_ret == NIXL_SUCCESS) {
@@ -175,14 +310,57 @@ public:
         return out_ret;
     }
 
-    [[nodiscard]] nixlUcxWorker *
-    getWorker() const noexcept {
-        return worker_;
-    }
+    /**
+     * Callback-mode status check: Mooncake-style O(1) completion detection.
+     *
+     * In busy-poll mode, the progress thread is the sole driver of
+     * worker->progress() in a tight loop. The user thread NEVER calls
+     * progress() — it only reads atomic counters. This eliminates all
+     * UCX worker lock contention.
+     *
+     * Legacy requests (e.g. notification sendAm) are still tracked via
+     * the requests_ vector and need progress-driven polling.
+     */
+    [[nodiscard]] nixl_status_t
+    statusCallback() {
+        if (!busyPollMode_) {
+            while (worker_->progress())
+                ;
+        }
 
-    [[nodiscard]] size_t
-    getWorkerId() const noexcept {
-        return workerId_;
+        /* Check callback-tracked completions (RMA data ops + flush) */
+        size_t completed = completedCount_.load(std::memory_order_acquire);
+        size_t failed = failedCount_.load(std::memory_order_acquire);
+
+        if (failed > 0) {
+            return checkConnection(NIXL_ERR_BACKEND);
+        }
+
+        bool dataComplete = (completed >= totalPosted_);
+
+        /* Check legacy requests (notification sendAm) */
+        bool legacyComplete = true;
+        if (!requests_.empty()) {
+            size_t incomplete_reqs = 0;
+            for (nixlUcxReq req : requests_) {
+                nixl_status_t ret = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
+                if (ret == NIXL_SUCCESS) {
+                    worker_->reqRelease(req);
+                } else if (ret == NIXL_IN_PROG) {
+                    legacyComplete = false;
+                    requests_[incomplete_reqs++] = req;
+                } else {
+                    return checkConnection(ret);
+                }
+            }
+            requests_.resize(incomplete_reqs);
+        }
+
+        if (dataComplete && legacyComplete) {
+            connections_.clear();
+            return NIXL_SUCCESS;
+        }
+        return NIXL_IN_PROG;
     }
 };
 
@@ -195,7 +373,9 @@ public:
  */
 class nixlUcxThread {
 public:
-    nixlUcxThread(const nixlUcxEngine *engine, size_t num_workers) : engine_(engine) {
+    nixlUcxThread(const nixlUcxEngine *engine, size_t num_workers)
+        : engine_(engine),
+          numaNode_(engine->getDeviceNumaNode()) {
         workers_.reserve(num_workers);
     }
 
@@ -240,6 +420,13 @@ public:
 
     void
     operator()() {
+        /* Bind thread to the same NUMA node as the network device */
+        if (numaNode_ >= 0) {
+            int ret = nixl::ucx::numa::bindThreadToNumaNode(numaNode_);
+            if (ret == 0) {
+                NIXL_DEBUG << "Progress thread bound to NUMA node " << numaNode_;
+            }
+        }
         tlsThread() = this;
         threadActive_->set_value();
         run();
@@ -273,12 +460,15 @@ private:
     std::vector<size_t> workerIds_;
     std::unique_ptr<std::thread> thread_;
     std::unique_ptr<std::promise<void>> threadActive_;
+    int numaNode_;  // NUMA node to bind this thread to (-1 = no binding)
 };
 
 class nixlUcxSharedThread : public nixlUcxThread {
 public:
-    nixlUcxSharedThread(const nixlUcxEngine *engine, size_t num_workers, nixlTime::us_t delay)
-        : nixlUcxThread(engine, num_workers) {
+    nixlUcxSharedThread(const nixlUcxEngine *engine, size_t num_workers,
+                        nixlTime::us_t delay, bool busyPoll = false)
+        : nixlUcxThread(engine, num_workers),
+          busyPoll_(busyPoll) {
         if (pipe(controlPipe_) < 0) {
             throw std::runtime_error("Couldn't create progress thread control pipe");
         }
@@ -291,8 +481,10 @@ public:
         int delay_us = std::min((int)delay, std::numeric_limits<int>::max());
         delay_ = std::chrono::ceil<std::chrono::milliseconds>(std::chrono::microseconds(delay_us));
 
-        pollFds_.resize(num_workers + 1);
-        pollFds_.back() = {controlPipe_[0], POLLIN, 0};
+        if (!busyPoll_) {
+            pollFds_.resize(num_workers + 1);
+            pollFds_.back() = {controlPipe_[0], POLLIN, 0};
+        }
     }
 
     ~nixlUcxSharedThread() {
@@ -302,21 +494,64 @@ public:
 
     void
     join() override {
-        const char signal = 'X';
-        int ret = write(controlPipe_[1], &signal, sizeof(signal));
-        if (ret < 0) NIXL_PERROR << "write to progress thread control pipe failed";
+        if (busyPoll_) {
+            stop_.store(true, std::memory_order_release);
+        } else {
+            const char signal = 'X';
+            int ret = write(controlPipe_[1], &signal, sizeof(signal));
+            if (ret < 0) NIXL_PERROR << "write to progress thread control pipe failed";
+        }
         nixlUcxThread::join();
     }
 
     void
     addWorker(nixlUcxWorker *worker, size_t worker_id) override {
-        pollFds_[getWorkers().size()] = {worker->getEfd(), POLLIN, 0};
+        if (!busyPoll_) {
+            pollFds_[getWorkers().size()] = {worker->getEfd(), POLLIN, 0};
+        }
         nixlUcxThread::addWorker(worker, worker_id);
+    }
+
+    bool
+    isBusyPoll() const {
+        return busyPoll_;
     }
 
 protected:
     void
     run() override {
+        if (busyPoll_) {
+            runBusyPoll();
+        } else {
+            runEventDriven();
+        }
+    }
+
+private:
+    /**
+     * Mooncake-style busy-poll loop: tight loop calling worker->progress()
+     * for each worker. This thread is the SOLE driver of CQ processing.
+     * No arm(), no poll(), no sleeping — minimum latency completion detection.
+     */
+    void
+    runBusyPoll() {
+        NIXL_DEBUG << "shared " << *this << " running in busy-poll mode";
+
+        while (!stop_.load(std::memory_order_acquire)) {
+            for (auto *worker : getWorkers()) {
+                worker->progress();
+            }
+        }
+
+        NIXL_DEBUG << "shared " << *this << " exiting busy-poll mode";
+    }
+
+    /**
+     * Original event-driven loop: arm() → poll() → progress().
+     * Used when busy_poll is not enabled (default legacy behavior).
+    */
+    void
+    runEventDriven() {
         NIXL_DEBUG << "shared " << *this << " running";
         // Set timeout event so that the main loop would progress all workers on first iteration
         bool timeout = true;
@@ -352,10 +587,11 @@ protected:
         NIXL_DEBUG << "shared " << *this << " exiting";
     }
 
-private:
-    std::chrono::milliseconds delay_;
-    int controlPipe_[2];
-    std::vector<pollfd> pollFds_;
+     bool busyPoll_;
+     std::atomic<bool> stop_{false};
+     std::chrono::milliseconds delay_;
+     int controlPipe_[2];
+     std::vector<pollfd> pollFds_;
 };
 
 nixlUcxThreadEngine::nixlUcxThreadEngine(const nixlBackendInitParams &init_params)
@@ -364,12 +600,22 @@ nixlUcxThreadEngine::nixlUcxThreadEngine(const nixlBackendInitParams &init_param
         throw std::invalid_argument("UCX library does not support multi-threading");
     }
 
+    /* Enable Mooncake-style busy-poll by default when progress thread is active.
+     * Can be disabled via custom parameter "busy_poll=0". */
+    busyPoll_ = nixl_b_params_get(init_params.customParams, "busy_poll", 1) != 0;
+
     size_t num_workers = getWorkers().size();
-    thread_ = std::make_unique<nixlUcxSharedThread>(this, num_workers, init_params.pthrDelay);
+    thread_ = std::make_unique<nixlUcxSharedThread>(this, num_workers,
+        init_params.pthrDelay,
+        busyPoll_);
     for (size_t i = 0; i < num_workers; i++) {
         thread_->addWorker(getWorkers()[i].get(), i);
     }
     thread_->start();
+
+    if (busyPoll_) {
+        NIXL_INFO << "Mooncake-style busy-poll progress thread enabled";
+    }
 }
 
 nixlUcxThreadEngine::~nixlUcxThreadEngine() {
@@ -408,6 +654,8 @@ struct nixlUcxBackendSharedState;
 class nixlUcxChunkBackendReqH : public nixlUcxBackendReqH {
 public:
     nixlUcxChunkBackendReqH() : nixlUcxBackendReqH(nullptr, UINT64_MAX) {}
+    nixlUcxChunkBackendReqH(nixlUcxChunkBackendReqH &&) noexcept = default;
+    nixlUcxChunkBackendReqH &operator=(nixlUcxChunkBackendReqH &&) = delete;
 
     void
     startXfer(const std::shared_ptr<nixlUcxBackendSharedState> &shared_state,
@@ -795,7 +1043,8 @@ nixlUcxEngine::create(const nixlBackendInitParams &init_params) {
 
 nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
     : nixlBackendEngine(&init_params),
-      sharedWorkerIndex_(1) {
+      sharedWorkerIndex_(1),
+      progressThreadEnabled_(init_params.enableProgTh) {
     std::vector<std::string> devs; /* Empty vector */
     nixl_b_params_t *custom_params = init_params.customParams;
 
@@ -840,6 +1089,24 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
     auto &uw = uws.front();
     workerAddr = uw->epAddr();
     uw->regAmCallback(nixl::ucx::am_cb_op_t::NOTIF_STR, notifAmCb, this);
+
+    /* Determine NUMA node of the network device(s) */
+    devNames_ = devs;
+    if (!devNames_.empty()) {
+        // Use the first device's NUMA node as the primary binding target.
+        // Strip port suffix if present (e.g., "mlx5_0:1" -> "mlx5_0")
+        std::string primary_dev = devNames_[0];
+        size_t colon_pos = primary_dev.find(':');
+        if (colon_pos != std::string::npos) {
+            primary_dev = primary_dev.substr(0, colon_pos);
+        }
+        deviceNumaNode_ = nixl::ucx::numa::getDeviceNumaNode(primary_dev);
+        NIXL_INFO << "UCX engine primary device " << primary_dev
+                  << " on NUMA node " << deviceNumaNode_;
+    } else {
+        NIXL_DEBUG << "No device_list specified, NUMA affinity disabled";
+        deviceNumaNode_ = -1;
+    }
 }
 
 nixl_mem_list_t nixlUcxEngine::getSupportedMems () const {
@@ -1042,6 +1309,17 @@ nixlUcxEngine::getWorkerId(const nixl_opt_b_args_t *opt_args) const noexcept {
     if (it == tlsSharedWorkerMap().end()) {
         const size_t index = sharedWorkerIndex_.fetch_add(1) % getSharedWorkersSize();
         it = tlsSharedWorkerMap().emplace(this, index).first;
+        /* Log cross-NUMA situation as informational */
+        if (deviceNumaNode_ >= 0) {
+            int thread_numa = nixl::ucx::numa::getCurrentThreadNumaNode();
+            if (thread_numa >= 0 && thread_numa != deviceNumaNode_) {
+                NIXL_INFO << "Thread " << std::this_thread::get_id()
+                          << " is on NUMA node " << thread_numa
+                          << " but NIC is on NUMA node " << deviceNumaNode_
+                          << ". Progress thread is NUMA-bound; post path runs on caller thread.";
+            }
+        }
+
         NIXL_DEBUG << "engine " << this << " bound shared worker " << index << " to thread "
                    << std::this_thread::get_id();
     }
@@ -1156,8 +1434,9 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                                   const nixl_meta_dlist_t &remote,
                                   size_t worker_id,
                                   size_t start_idx,
-                                  size_t end_idx) {
-    batchResult result = {NIXL_SUCCESS, 0, nullptr};
+                                  size_t end_idx,
+                                  nixlUcxCompletionCtx *comp_ctx) {
+    batchResult result = {NIXL_SUCCESS, 0, nullptr, 0};
 
     for (size_t i = start_idx; i < end_idx; ++i) {
         void *laddr = (void *)local[i].addr;
@@ -1175,15 +1454,22 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
         ++result.size;
         nixlUcxReq req;
         const nixl_status_t ret = operation == NIXL_READ ?
-            ep.read(raddr, rmd->getRkey(worker_id), laddr, lmd->mem, lsize, req) :
-            ep.write(laddr, lmd->mem, raddr, rmd->getRkey(worker_id), lsize, req);
+            ep.read(raddr, rmd->getRkey(worker_id), laddr, lmd->mem, lsize, req, comp_ctx) :
+            ep.write(laddr, lmd->mem, raddr, rmd->getRkey(worker_id), lsize, req, comp_ctx);
 
         if (ret == NIXL_IN_PROG) {
+            ++result.inflightCount;
             if (result.req != nullptr) [[likely]] {
                 ucp_request_free(result.req);
             }
             result.req = req;
-        } else if (ret != NIXL_SUCCESS) {
+        } else if (ret == NIXL_SUCCESS) {
+            /* Completed immediately. In callback mode the counter was already
+             * incremented by read()/write(). Count it for inflightCount. */
+            if (comp_ctx) {
+                ++result.inflightCount;
+            }
+        } else {
             result.status = ret;
             if (result.req != nullptr) {
                 ucp_request_free(result.req);
@@ -1209,6 +1495,7 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
                              size_t end_idx) const {
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
     const size_t worker_id = int_handle->getWorkerId();
+    nixlUcxCompletionCtx *comp_ctx = int_handle->getCompCtx();
 
     if (operation != NIXL_WRITE && operation != NIXL_READ) {
         return NIXL_ERR_INVALID_PARAM;
@@ -1223,10 +1510,13 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
         const auto rmd = static_cast<nixlUcxPublicMetadata *>(remote[i].metadataP);
         auto &ep = rmd->conn->getEp(worker_id);
         const batchResult result =
-            sendXferRangeBatch(*ep, operation, local, remote, worker_id, i, end_idx);
+            sendXferRangeBatch(*ep, operation, local, remote, worker_id, i,
+                               end_idx, comp_ctx);
 
-        /* Append a single pending request for the entire EP batch */
-        const nixl_status_t ret = int_handle->append(result.status, result.req, rmd->conn);
+        /* Append a single pending request for the entire EP batch.
+         * In callback mode, inflightCount tracks how many completions to expect. */
+        const nixl_status_t ret = int_handle->append(result.status, result.req,
+                                                     rmd->conn, result.inflightCount);
         if (ret != NIXL_SUCCESS) {
             return ret;
         }
@@ -1239,11 +1529,16 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
      * completed, which can happen after local requests completion.
      * We need to flush all distinct connections to ensure that the operation
      * is actually completed.
+     *
+     * In callback mode, each flush also gets a callback and contributes
+     * to totalPosted_.
      */
     for (auto &conn : int_handle->getConnections()) {
         nixlUcxReq req;
-        const nixl_status_t ret = conn->getEp(worker_id)->flushEp(req);
-        if (int_handle->append(ret, req, conn) != NIXL_SUCCESS) {
+        const nixl_status_t ret = conn->getEp(worker_id)->flushEp(req, comp_ctx);
+        /* Each flush is 1 inflight request tracked by callback */
+        size_t flushInflight = comp_ctx ? 1 : 0;
+        if (int_handle->append(ret, req, conn, flushInflight) != NIXL_SUCCESS) {
             return ret;
         }
     }
@@ -1271,6 +1566,12 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // TODO: assert that handle is empty/completed, as we can't post request before completion
 
+    /* Enable Mooncake-style callback mode when busy-poll progress thread is active.
+     * This ensures status() never calls worker->progress(), avoiding lock contention. */
+     if (progressThreadEnabled_ && isBusyPoll()) {
+        int_handle->enableCallbackMode(/*busyPoll=*/true);
+    }
+
     ret = sendXferRange(operation, local, remote, remote_agent, handle, 0, lcnt);
     if (ret != NIXL_SUCCESS) {
         return ret;
@@ -1285,7 +1586,8 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
                                 opt_args->notifMsg,
                                 rmd->conn->getEp(int_handle->getWorkerId()),
                                 &req);
-            if (int_handle->append(ret, req, rmd->conn) != NIXL_SUCCESS) {
+            /* Notification sendAm has its own callback mechanism, track via legacy path */
+            if (int_handle->appendLegacy(ret, req, rmd->conn) != NIXL_SUCCESS) {
                 return ret;
             }
 
@@ -1303,16 +1605,15 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
     const nixl_status_t handle_status = int_handle->status();
 
-    if ((handle_status == NIXL_IN_PROG) || !int_handle->notif) {
+    if ((handle_status != NIXL_SUCCESS) || !int_handle->notif) {
+        if (handle_status != NIXL_IN_PROG) { // error flow
+            int_handle->notif.reset();
+        }
         return handle_status;
     }
 
     const nixlUcxBackendReqH::Notif notif(std::move(int_handle->notif).value());
     int_handle->notif.reset();
-
-    if (handle_status != NIXL_SUCCESS) [[unlikely]] {
-        return handle_status;
-    }
 
     const ucx_connection_ptr_t conn = getConnection(notif.agent);
     if (!conn) [[unlikely]] {
@@ -1323,7 +1624,8 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
     const auto &ep = conn->getEp(int_handle->getWorkerId());
     const nixl_status_t status = notifSendPriv(notif.agent, notif.payload, ep, &req);
 
-    if (int_handle->append(status, req, conn) != NIXL_SUCCESS) {
+    /* Notification sendAm uses legacy tracking (has its own callback) */
+    if (int_handle->appendLegacy(status, req, conn) != NIXL_SUCCESS) {
         return status;
     }
 
