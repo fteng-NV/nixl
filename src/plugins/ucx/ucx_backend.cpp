@@ -603,7 +603,7 @@ nixlUcxThreadEngine::nixlUcxThreadEngine(const nixlBackendInitParams &init_param
 
     /* Enable Mooncake-style busy-poll by default when progress thread is active.
      * Can be disabled via custom parameter "busy_poll=0". */
-    busyPoll_ = nixl_b_params_get(init_params.customParams, "busy_poll", 1) != 0;
+    busyPoll_ = nixl::getBackendParamDefaulted<int>(init_params.customParams, "busy_poll", 1) != 0;
 
     size_t num_workers = getWorkers().size();
     thread_ = std::make_unique<nixlUcxSharedThread>(this, num_workers,
